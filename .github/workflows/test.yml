@@ -1,0 +1,125 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      # Keep these checks in this file so students only need to copy one workflow.
+      - name: Check required files and pytest configuration
+        run: |
+          python - <<'PY'
+          import configparser
+          import subprocess
+          from pathlib import Path
+
+          required = [
+              "README.md", ".gitignore", "requirements.txt", "pytest.ini",
+              "calculator/__init__.py",
+              "tests/operations/test_add.py", "tests/operations/test_subtract.py",
+              ".github/workflows/tests.yml",
+          ]
+          tracked = set(subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0"))
+          problems = []
+          for name in required:
+              path = Path(name)
+              if name not in tracked or not path.is_file() or path.stat().st_size == 0:
+                  problems.append(f"Create, save, and commit the required nonempty file: {name}")
+          config = configparser.ConfigParser()
+          config.read("pytest.ini")
+          for key, expected in [("testpaths", "tests"), ("pythonpath", ".")]:
+              if config.get("pytest", key, fallback="").strip() != expected:
+                  problems.append(f"In pytest.ini, set {key} = {expected} under [pytest].")
+          if problems:
+              raise SystemExit("\n".join(problems))
+          print("Required files are committed and pytest configuration is correct.")
+          PY
+
+      - name: Check for committed environments and caches
+        run: |
+          python - <<'PY'
+          import subprocess
+          from pathlib import PurePosixPath
+
+          tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          forbidden_dirs = {".venv", "venv", "env", ".env", "__pycache__", ".pytest_cache"}
+          unwanted = []
+          for name in filter(None, tracked):
+              path = PurePosixPath(name)
+              if (forbidden_dirs.intersection(path.parts[:-1])
+                      or path.name == "pyvenv.cfg"
+                      or path.suffix in {".pyc", ".pyo", ".pyd"}):
+                  unwanted.append(name)
+          if unwanted:
+              raise SystemExit(
+                  "Remove these generated files from Git tracking (keep local copies with "
+                  "git rm -r --cached PATH), update .gitignore, commit, and push:\n"
+                  + "\n".join(unwanted)
+              )
+          # Probe ignore behavior without creating files or trusting a global ignore file.
+          probes = [
+              ".venv/assessment-probe.txt",
+              "calculator/__pycache__/assessment-probe.txt",
+              ".pytest_cache/assessment-probe.txt",
+              "calculator/assessment-probe.pyc",
+              "calculator/assessment-probe.pyo",
+              "calculator/assessment-probe.pyd",
+          ]
+          missing = [name for name in probes if subprocess.run(
+              ["git", "-c", "core.excludesFile=/dev/null", "check-ignore", "--no-index", "-q", name]
+          ).returncode != 0]
+          if missing:
+              raise SystemExit("Update .gitignore to exclude these generated paths:\n" + "\n".join(missing))
+          print("No tracked environments or caches; required ignore rules work.")
+          PY
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Run tests
+        run: python -m pytest -v -o xfail_strict=true --junitxml="$RUNNER_TEMP/pytest-results.xml"
+
+      - name: Verify both required tests passed
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = ET.parse(Path(os.environ["RUNNER_TEMP"]) / "pytest-results.xml")
+          required = {
+              ("tests.operations.test_add", "test_add"),
+              ("tests.operations.test_subtract", "test_subtract"),
+          }
+          passed = {
+              (case.get("classname"), case.get("name"))
+              for case in report.iter("testcase")
+              if not any(child.tag in {"failure", "error", "skipped"} for child in case)
+          }
+          missing = required - passed
+          if missing:
+              names = ", ".join(f"{module}::{name}" for module, name in sorted(missing))
+              raise SystemExit(
+                  "Required tests must be discovered and pass, without skips or xfail: " + names
+              )
+          print("Both required addition and subtraction tests ran and passed.")
+          PY
